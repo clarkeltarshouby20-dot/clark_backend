@@ -22,6 +22,8 @@
 
 import db from "../config/db.js";
 import slugify from "slugify";
+import { ensureCategorySchema } from "../utils/categorySchema.js";
+import { ensureFinancialColumns } from "../utils/financialSchema.js";
 
 // ── createCategory ─────────────────────────────────────────────────────────────
 /**
@@ -142,6 +144,71 @@ const getCategoriesWithProducts = async (req, res, next) => {
   }
 };
 
+// ── getMostVisitedCategories ───────────────────────────────────────────────────
+/**
+ * GET /api/categories/most-visited?limit=2
+ *
+ * Returns active categories ordered by visit_count (desc).
+ * Falls back to sort_order when visit counts are tied or zero.
+ */
+const getMostVisitedCategories = async (req, res, next) => {
+  try {
+    await ensureCategorySchema();
+    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 2, 1), 6);
+
+    const [rows] = await db.query(
+      `
+      SELECT *
+      FROM categories
+      WHERE is_active = 1
+      ORDER BY visit_count DESC, sort_order ASC, id ASC
+      LIMIT ?
+    `,
+      [limit],
+    );
+
+    res.status(200).json({
+      success: true,
+      message: "Most visited categories fetched successfully",
+      data: rows,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+// ── recordCategoryVisit ────────────────────────────────────────────────────────
+/**
+ * POST /api/categories/:id/visit
+ *
+ * Increments the visit counter for a category (homepage promos, filters, etc.).
+ */
+const recordCategoryVisit = async (req, res, next) => {
+  try {
+    await ensureCategorySchema();
+    const { id } = req.params;
+
+    const [result] = await db.query(
+      "UPDATE categories SET visit_count = visit_count + 1 WHERE id = ? AND is_active = 1",
+      [id],
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "Category not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      message: "Category visit recorded",
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 // ── getAllCategories ───────────────────────────────────────────────────────────
 /**
  * GET /api/categories
@@ -154,6 +221,7 @@ const getCategoriesWithProducts = async (req, res, next) => {
  */
 const getAllCategories = async (req, res, next) => {
   try {
+    await ensureCategorySchema();
     const [rows] = await db.query("SELECT * FROM categories");
     if (rows.length === 0) {
       return res.status(400).json({ message: "Categories not found" });
@@ -406,13 +474,146 @@ const deleteCategory = async (req, res, next) => {
   }
 };
 
+// ── applyCategoryDiscount ──────────────────────────────────────────────────────
+function roundMoney(value) {
+  return Math.round(Number(value) * 100) / 100;
+}
+
+function computeDiscountedPrice(listPrice, discountType, discountValue) {
+  const list = roundMoney(listPrice);
+  if (discountType === "percent") {
+    const pct = Math.min(Math.max(Number(discountValue), 0), 100);
+    return roundMoney(Math.max(list * (1 - pct / 100), 0));
+  }
+  const fixed = roundMoney(discountValue);
+  return roundMoney(Math.max(list - fixed, 0));
+}
+
+/**
+ * POST /api/categories/:id/apply-discount
+ * Applies a percentage or fixed discount to every product in the category.
+ */
+const applyCategoryDiscount = async (req, res, next) => {
+  try {
+    await ensureCategorySchema();
+    await ensureFinancialColumns();
+    const { id } = req.params;
+    const { discount_type, discount_value } = req.body || {};
+
+    const discountType =
+      discount_type === "fixed"
+        ? "fixed"
+        : discount_type === "percent"
+          ? "percent"
+          : null;
+    const value = Number.parseFloat(discount_value);
+
+    if (!discountType || Number.isNaN(value) || value <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Discount type and value are required.",
+      });
+    }
+
+    if (discountType === "percent" && value > 100) {
+      return res.status(400).json({
+        success: false,
+        message: "Percentage cannot exceed 100.",
+      });
+    }
+
+    const [categories] = await db.query(
+      "SELECT id, name FROM categories WHERE id = ?",
+      [id],
+    );
+    if (!categories.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Category not found.",
+      });
+    }
+
+    const [products] = await db.query(
+      "SELECT id, price, old_price, net_profit, original_price FROM products WHERE category_id = ?",
+      [id],
+    );
+
+    if (!products.length) {
+      return res.status(400).json({
+        success: false,
+        message: "This category has no products.",
+      });
+    }
+
+    const connection = await db.getConnection();
+    try {
+      await connection.beginTransaction();
+      let updated = 0;
+
+      for (const product of products) {
+        const listPrice = roundMoney(product.price);
+        const newPrice = computeDiscountedPrice(listPrice, discountType, value);
+
+        if (newPrice >= listPrice) {
+          continue;
+        }
+
+        const originalPrice = roundMoney(
+          product.original_price ??
+            Number(product.price || 0) + Number(product.net_profit || 0),
+        );
+        const additionalDiscount = roundMoney(listPrice - newPrice);
+        const newProductDiscount = roundMoney(
+          Number(product.old_price || 0) + additionalDiscount,
+        );
+        const newNetProfit = roundMoney(originalPrice - newPrice);
+
+        await connection.query(
+          "UPDATE products SET price = ?, old_price = ?, net_profit = ? WHERE id = ?",
+          [newPrice, newProductDiscount, newNetProfit, product.id],
+        );
+        updated += 1;
+      }
+
+      await connection.query(
+        "UPDATE categories SET discount_type = ?, discount_value = ? WHERE id = ?",
+        [discountType, value, id],
+      );
+
+      await connection.commit();
+
+      res.status(200).json({
+        success: true,
+        message: `Discount applied to ${updated} product(s).`,
+        data: {
+          updated_count: updated,
+          category_id: Number(id),
+          category_name: categories[0].name,
+          discount_type: discountType,
+          discount_value: value,
+        },
+      });
+    } catch (error) {
+      await connection.rollback();
+      throw error;
+    } finally {
+      connection.release();
+    }
+  } catch (error) {
+    next(error);
+  }
+};
+
 // ── Exports ────────────────────────────────────────────────────────────────────
 export {
   createCategory,
   getAllCategories,
   getCategoriesWithProducts,
+  getMostVisitedCategories,
+  recordCategoryVisit,
   getCategoryById,
   getCategoryByIdWithProducts,
   updateCategory,
   deleteCategory,
+  applyCategoryDiscount,
 };

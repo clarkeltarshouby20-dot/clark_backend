@@ -17,6 +17,7 @@ import db from "../config/db.js";
 import { v2 as cloudinary } from "cloudinary";
 import { normalizeGovernorates } from "../utils/egyptGovernorates.js";
 import { decodeHtmlEntities } from "../utils/html.js";
+import { ensureSettingsSchema } from "../utils/settingsSchema.js";
 
 function normalizeCurrencyCode(value) {
   const normalized = String(value || "").trim().toUpperCase();
@@ -52,6 +53,7 @@ function buildSettingsPayload(source = {}, old = {}) {
     header_scripts: source.header_scripts ?? old.header_scripts ?? "",
     footer_scripts: source.footer_scripts ?? old.footer_scripts ?? "",
     social_facebook: source.social_facebook?.trim() || old.social_facebook || "",
+    social_instagram: source.social_instagram?.trim() || old.social_instagram || "",
     social_x: source.social_x?.trim() || old.social_x || "",
     social_whatsapp: source.social_whatsapp?.trim() || old.social_whatsapp || "",
     social_telegram: source.social_telegram?.trim() || old.social_telegram || "",
@@ -102,6 +104,7 @@ async function cleanupCloudinary(newPath, oldUrl) {
  */
 const getSettings = async (_req, res, next) => {
   try {
+    await ensureSettingsSchema();
     const [rows] = await db.query("SELECT * FROM site_settings LIMIT 1");
     const settings = normalizeSettingsAssets(rows[0] || {});
     settings.shipping_governorates = normalizeGovernorates(
@@ -134,6 +137,7 @@ const getSettings = async (_req, res, next) => {
  */
 const updateSettings = async (req, res, next) => {
   try {
+    await ensureSettingsSchema();
     const [existingRows] = await db.query("SELECT * FROM site_settings LIMIT 1");
     const old = normalizeSettingsAssets(existingRows[0] || {});
 

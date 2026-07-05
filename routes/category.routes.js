@@ -5,10 +5,13 @@ import {
   createCategory,
   getAllCategories,
   getCategoriesWithProducts,
+  getMostVisitedCategories,
+  recordCategoryVisit,
   getCategoryById,
   updateCategory,
   deleteCategory,
   getCategoryByIdWithProducts,
+  applyCategoryDiscount,
 } from "../controllers/category.controllers.js";
 
 const router = Router();
@@ -16,6 +19,8 @@ const router = Router();
 // ── Public ─────────────────────────────────────────────────────────
 router.get("/", getAllCategories);
 router.get("/with-products", getCategoriesWithProducts);
+router.get("/most-visited", getMostVisitedCategories);
+router.post("/:id/visit", recordCategoryVisit);
 router.get("/:id", getCategoryById);
 router.get("/:id/with-products", getCategoryByIdWithProducts);
 
@@ -42,5 +47,11 @@ router.put(
   updateCategory,
 );
 router.delete("/:id", verifyToken, verifyAdminOrOwner, deleteCategory);
+router.post(
+  "/:id/apply-discount",
+  verifyToken,
+  verifyAdminOrOwner,
+  applyCategoryDiscount,
+);
 
 export default router;

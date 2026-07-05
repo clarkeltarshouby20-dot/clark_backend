@@ -84,6 +84,33 @@ async function ensureFinancialColumnsWithConnection(connection) {
     `);
   }
 
+  const productHasOriginalPrice = await hasColumn(
+    connection,
+    "products",
+    "original_price",
+  );
+  if (!productHasOriginalPrice) {
+    await connection.query(`
+      ALTER TABLE products
+      ADD COLUMN original_price DECIMAL(10,2) NOT NULL DEFAULT 0.00
+      AFTER net_profit
+    `);
+
+    // Backfill list/original price from legacy selling price + stored margin.
+    await connection.query(`
+      UPDATE products
+      SET original_price = price + net_profit
+      WHERE original_price = 0 AND (price > 0 OR net_profit > 0)
+    `);
+
+    // Legacy old_price stored the pre-discount list price — convert to discount amount.
+    await connection.query(`
+      UPDATE products
+      SET old_price = old_price - price
+      WHERE old_price IS NOT NULL AND old_price > price
+    `);
+  }
+
   // ── Check order_items.unit_net_profit ──────────────────────────────────────
   const orderItemsHaveUnitNetProfit = await hasColumn(
     connection,

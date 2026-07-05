@@ -25,6 +25,8 @@ import slugify from "slugify";
 import jwt from "jsonwebtoken";
 import { expandQuery } from "../utils/searchHelper.js";
 import { ensureFinancialColumns } from "../utils/financialSchema.js";
+import { ensurePosSchema } from "../utils/posSchema.js";
+import { assignBarcodeToProduct } from "../services/posBarcodeService.js";
 
 const ALPHA_SIZES = ["S", "M", "L", "XL", "XXL", "XXXL"];
 const NUMERIC_SIZES = Array.from({ length: 21 }, (_, index) =>
@@ -336,12 +338,16 @@ async function saveProductRecord(req, existingProduct = null) {
   try {
     await ensureFinancialColumns(connection);
 
+    await ensurePosSchema();
+
+    let generatedBarcode = null;
+
     let {
       name,
       name_ar,
       category_id,
       price,
-      net_profit,
+      original_price,
       old_price,
       description,
       description_ar,
@@ -367,7 +373,7 @@ async function saveProductRecord(req, existingProduct = null) {
     const hasColors = normalizedColors.length > 0;
     const hasVariants = hasColors || normalizedSizeOptions.length > 0;
 
-    if (!name || !category_id || !price || !description) {
+    if (!name || !category_id || !price || !original_price || !description) {
       const error = new Error("All required product fields must be provided.");
       error.status = 400;
       throw error;
@@ -386,34 +392,35 @@ async function saveProductRecord(req, existingProduct = null) {
     }
 
     price = parseFloat(price);
-    net_profit = net_profit !== undefined && net_profit !== ""
-      ? parseFloat(net_profit)
-      : 0;
-    old_price = old_price ? parseFloat(old_price) : null;
+    original_price = parseFloat(original_price);
+    old_price =
+      old_price !== undefined && old_price !== "" && old_price !== null
+        ? parseFloat(old_price)
+        : null;
     is_active =
       is_active !== undefined
         ? `${is_active}` === "1" || `${is_active}` === "true"
         : existingProduct?.is_active ?? true;
 
-    if (Number.isNaN(price)) {
-      const error = new Error("Price must be a valid number.");
+    if (Number.isNaN(price) || price < 0) {
+      const error = new Error("Selling price must be a valid number.");
       error.status = 400;
       throw error;
     }
 
-    if (Number.isNaN(net_profit) || net_profit < 0) {
-      const error = new Error("Net profit must be zero or greater.");
+    if (Number.isNaN(original_price) || original_price < 0) {
+      const error = new Error("Original price must be a valid number.");
       error.status = 400;
       throw error;
     }
 
-    if (old_price !== null && old_price <= price) {
-      const error = new Error(
-        "Original price must be higher than current price.",
-      );
+    if (old_price !== null && (Number.isNaN(old_price) || old_price < 0)) {
+      const error = new Error("Discount must be zero or greater.");
       error.status = 400;
       throw error;
     }
+
+    const net_profit = Math.round((original_price - price) * 100) / 100;
 
     const expectedCombos = getExpectedVariantCombos(
       normalizedColors,
@@ -519,7 +526,7 @@ async function saveProductRecord(req, existingProduct = null) {
       await connection.query(
         `
           UPDATE products
-          SET name = ?, name_ar = ?, category_id = ?, price = ?, old_price = ?,
+          SET name = ?, name_ar = ?, category_id = ?, price = ?, original_price = ?, old_price = ?,
               slug = ?, description = ?, description_ar = ?, specs_en = ?, specs_ar = ?,
               stock = ?, is_active = ?, size_mode = ?, net_profit = ?
           WHERE id = ?
@@ -529,6 +536,7 @@ async function saveProductRecord(req, existingProduct = null) {
           name_ar || null,
           category_id,
           price,
+          original_price,
           old_price,
           slug,
           description,
@@ -546,15 +554,16 @@ async function saveProductRecord(req, existingProduct = null) {
       const [result] = await connection.query(
         `
           INSERT INTO products (
-            name, name_ar, category_id, price, net_profit, old_price, slug, description,
+            name, name_ar, category_id, price, original_price, net_profit, old_price, slug, description,
             description_ar, specs_en, specs_ar, stock, is_active, size_mode
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           name,
           name_ar || null,
           category_id,
           price,
+          original_price,
           net_profit,
           old_price,
           slug,
@@ -568,6 +577,7 @@ async function saveProductRecord(req, existingProduct = null) {
         ],
       );
       productId = result.insertId;
+      generatedBarcode = await assignBarcodeToProduct(connection, productId);
     }
 
     if (hasColors) {
@@ -747,6 +757,7 @@ async function saveProductRecord(req, existingProduct = null) {
         ? "Product updated successfully"
         : "Product created successfully",
       productId,
+      barcode: generatedBarcode,
     };
   } catch (error) {
     await connection.rollback();
@@ -785,7 +796,7 @@ function sanitizeProductForViewer(product, req) {
     return product;
   }
 
-  const { net_profit, ...publicProduct } = product;
+  const { net_profit, barcode, original_price, ...publicProduct } = product;
   return publicProduct;
 }
 
@@ -936,13 +947,14 @@ const getAllProducts = async (req, res, next) => {
 const getProductById = async (req, res, next) => {
   try {
     await ensureFinancialColumns();
+    await ensurePosSchema();
 
     const id = Number.parseInt(req.params.id, 10);
     if (!id) {
       return res.status(400).json({ message: "Product not found" });
     }
 
-    const [rows] = await db.query(
+    let [rows] = await db.query(
       `
         SELECT products.*, categories.name AS category_name, categories.name_ar AS category_name_ar
         FROM products
@@ -954,6 +966,11 @@ const getProductById = async (req, res, next) => {
 
     if (!rows.length) {
       return res.status(404).json({ message: "Product not found" });
+    }
+
+    if (canViewAdminFinancialFields(req) && !rows[0].barcode) {
+      const barcode = await assignBarcodeToProduct(db, id);
+      rows[0].barcode = barcode;
     }
 
     const supplementaryData = await getProductsSupplementaryData(db, [id]);

@@ -41,6 +41,9 @@ import messagesRoutes from "./routes/messages.routes.js";
 import couponRoutes from "./routes/coupon.routes.js";
 import wishlistRoutes from "./routes/wishlist.routes.js";
 import dashboardRoutes from "./routes/dashboard.routes.js";
+import posRoutes from "./routes/pos.routes.js";
+import expenseRoutes from "./routes/expense.routes.js";
+import { ensurePosSchema } from "./utils/posSchema.js";
 
 // ── App ───────────────────────────────────────────────────────────
 const app = express();
@@ -162,6 +165,8 @@ router.use("/messages", messagesRoutes);    // Contact Us form messages
 router.use("/coupons", couponRoutes);       // Discount coupon management
 router.use("/wishlist", wishlistRoutes);    // User wishlist (saved products)
 router.use("/dashboard", dashboardRoutes);  // Admin dashboard statistics
+router.use("/pos", posRoutes);              // In-store POS sales
+router.use("/expenses", expenseRoutes);    // Business expenses
 
 // Mount the sub-router — all routes are prefixed with /api
 app.use("/api", router);
@@ -185,7 +190,13 @@ app.use(errorHandler);
 const PORT = process.env.PORT || 5001;
 
 if (process.env.NODE_ENV !== "production") {
-  app.listen(PORT, () => {
+  app.listen(PORT, async () => {
+    try {
+      await ensurePosSchema();
+      console.log("✅ POS schema ready (barcode column + tables).");
+    } catch (error) {
+      console.error("⚠️ POS schema migration failed:", error.message);
+    }
     console.log(`✅ Local server running on http://localhost:${PORT}`);
     console.log("Connecting to:", process.env.DB_HOST);
   });

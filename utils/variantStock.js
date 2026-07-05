@@ -141,3 +141,57 @@ export async function restoreOrderItemStock(connection, orderId) {
   // Re-sync aggregate product stock for affected variant products
   await syncProductsStock(connection, [...variantProductIds]);
 }
+
+/**
+ * Deducts stock from a list of items (used by POS).
+ */
+export async function deductStockItems(connection, items = []) {
+  const variantProductIds = new Set();
+
+  for (const item of items) {
+    const qty = Number(item.quantity) || 0;
+    if (qty <= 0) continue;
+
+    if (item.variant_id) {
+      await connection.query(
+        "UPDATE product_variants SET stock = GREATEST(stock - ?, 0) WHERE id = ?",
+        [qty, item.variant_id],
+      );
+      variantProductIds.add(item.product_id);
+    } else {
+      await connection.query(
+        "UPDATE products SET stock = GREATEST(stock - ?, 0) WHERE id = ?",
+        [qty, item.product_id],
+      );
+    }
+  }
+
+  await syncProductsStock(connection, [...variantProductIds]);
+}
+
+/**
+ * Restores stock from a list of items (used by POS returns).
+ */
+export async function restoreStockItems(connection, items = []) {
+  const variantProductIds = new Set();
+
+  for (const item of items) {
+    const qty = Number(item.quantity) || 0;
+    if (qty <= 0) continue;
+
+    if (item.variant_id) {
+      await connection.query(
+        "UPDATE product_variants SET stock = stock + ? WHERE id = ?",
+        [qty, item.variant_id],
+      );
+      variantProductIds.add(item.product_id);
+    } else {
+      await connection.query(
+        "UPDATE products SET stock = stock + ? WHERE id = ?",
+        [qty, item.product_id],
+      );
+    }
+  }
+
+  await syncProductsStock(connection, [...variantProductIds]);
+}

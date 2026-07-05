@@ -895,6 +895,27 @@ export const updateOrderStatus = async (req, res, next) => {
       status,
     );
     const wasStockReserved = Boolean(Number(currentOrder.inventory_reserved || 0));
+    const terminalStatuses = ["cancelled", "rejected", "returned"];
+
+    if (
+      terminalStatuses.includes(currentOrder.status) &&
+      !terminalStatuses.includes(status)
+    ) {
+      await connection.rollback();
+      return res.status(400).json({
+        success: false,
+        message:
+          "This order is closed and cannot be moved back to an active status.",
+      });
+    }
+
+    if (status === currentOrder.status) {
+      await connection.rollback();
+      return res.status(200).json({
+        success: true,
+        message: `Order is already ${status}.`,
+      });
+    }
 
     if (status === "returned" && currentOrder.status !== "delivered") {
       await connection.rollback();
@@ -912,7 +933,8 @@ export const updateOrderStatus = async (req, res, next) => {
     }
 
     const nextPaymentStatus =
-      ["cancelled", "rejected"].includes(status) && currentOrder.status !== "cancelled"
+      ["cancelled", "rejected"].includes(status) &&
+      currentOrder.status !== "cancelled"
         ? "rejected"
         : status === "delivered"
           ? "paid"

@@ -7,9 +7,10 @@
  *
  * Statistics returned:
  *  - total_orders        — Total number of orders ever placed
- *  - delivered_revenue   — Sum of total_price for delivered orders only
- *  - delivered_net_profit — Sum of net profit from delivered order items
- *  - total_returns       — Count of orders marked as returned
+ *  - delivered_revenue   — Net revenue (online delivered + POS sales minus POS returns)
+ *  - delivered_net_profit — Net profit (online + POS; returns stored as negative)
+ *  - total_returns       — Count of returned orders (+ POS return transactions)
+ *  - total_pos_sales     — POS sale receipts with remaining non-returned items
  *  - pending_payments    — Count of orders awaiting payment verification
  *  - total_products      — Total product count
  *  - total_users         — Total user count (only visible to the "owner" role)
@@ -23,6 +24,8 @@
 
 import db from "../config/db.js";
 import { ensureFinancialColumns } from "../utils/financialSchema.js";
+import { ensurePosSchema } from "../utils/posSchema.js";
+import { ensureExpenseSchema } from "../utils/expenseSchema.js";
 
 // ── getDashboardStats ──────────────────────────────────────────────────────────
 /**
@@ -43,6 +46,8 @@ export const getDashboardStats = async (req, res, next) => {
     // Ensure the net_profit and unit_net_profit columns exist before querying
     // (added by ensureFinancialColumns if missing — schema migration guard)
     await ensureFinancialColumns();
+    await ensurePosSchema();
+    await ensureExpenseSchema();
 
     // Only the "owner" gets to see the total user count
     const isOwner = req.user?.role === "owner";
@@ -50,12 +55,16 @@ export const getDashboardStats = async (req, res, next) => {
     // Date Filters
     const { start_date, end_date } = req.query;
     let orderDateSql = "";
+    let posDateSql = "";
+    let expenseDateSql = "";
     let userDateSql = "";
     let productDateSql = "";
     let params = [];
 
     if (start_date && end_date) {
       orderDateSql = " AND o.created_at BETWEEN ? AND ?";
+      posDateSql = " AND ps.created_at BETWEEN ? AND ?";
+      expenseDateSql = " AND created_at BETWEEN ? AND ?";
       userDateSql = " WHERE created_at BETWEEN ? AND ?";
       productDateSql = " WHERE created_at BETWEEN ? AND ?";
       params = [new Date(start_date), new Date(end_date)];
@@ -71,6 +80,9 @@ export const getDashboardStats = async (req, res, next) => {
       [productRows],       // Total product count
       [recentOrders],      // 10 most recent orders (for activity feed)
       [userRows],          // Total user count (owner-only)
+      [posStatsRows],      // POS net revenue, profit, returns
+      [activePosSalesRows],// POS sales with remaining items
+      [expenseRows],       // Total expenses
     ] = await Promise.all([
       db.query(`SELECT COUNT(*) AS total_orders FROM orders o WHERE 1=1 ${orderDateSql}`, params),
 
@@ -81,16 +93,26 @@ export const getDashboardStats = async (req, res, next) => {
         WHERE o.status = 'delivered' ${orderDateSql}
       `, params),
 
-      // Net profit = sum of (unit_net_profit × quantity) for each delivered order item
-      // COALESCE chain: use snapshot value → fallback to current product price → default 0
+      // Net profit scaled by actual collected amount vs list price (coupon / discount aware)
       db.query(`
         SELECT COALESCE(
-          SUM(COALESCE(oi.unit_net_profit, p.net_profit, 0) * oi.quantity),
+          SUM(
+            COALESCE(oi.unit_net_profit, p.net_profit, 0) * oi.quantity *
+            CASE
+              WHEN order_gross.gross_total > 0 THEN o.total_price / order_gross.gross_total
+              ELSE 1
+            END
+          ),
           0
         ) AS delivered_net_profit
         FROM order_items oi
         INNER JOIN orders o ON o.id = oi.order_id
         LEFT JOIN products p ON p.id = oi.product_id
+        INNER JOIN (
+          SELECT order_id, SUM(price * quantity) AS gross_total
+          FROM order_items
+          GROUP BY order_id
+        ) order_gross ON order_gross.order_id = o.id
         WHERE o.status = 'delivered' ${orderDateSql}
       `, params),
 
@@ -130,15 +152,71 @@ export const getDashboardStats = async (req, res, next) => {
       isOwner
         ? db.query(`SELECT COUNT(*) AS total_users FROM users ${userDateSql}`, params)
         : Promise.resolve([[{ total_users: null }]]),
+
+      db.query(`
+        SELECT
+          COALESCE(SUM(
+            CASE
+              WHEN ps.transaction_type = 'sale' THEN ps.final_total
+              WHEN ps.transaction_type = 'return' THEN -ps.final_total
+              ELSE 0
+            END
+          ), 0) AS pos_net_revenue,
+          COALESCE(SUM(
+            CASE
+              WHEN ps.transaction_type = 'return' THEN -1
+              ELSE 1
+            END *
+            CASE
+              WHEN ps.subtotal_before_discount > 0 THEN LEAST(
+                ps.final_total,
+                (
+                  SELECT COALESCE(SUM(psi.unit_net_profit * psi.quantity), 0)
+                  FROM pos_sale_items psi
+                  WHERE psi.pos_sale_id = ps.id
+                ) * ps.final_total / ps.subtotal_before_discount
+              )
+              ELSE 0
+            END
+          ), 0) AS pos_net_profit,
+          COALESCE(SUM(CASE WHEN ps.transaction_type = 'return' THEN 1 ELSE 0 END), 0) AS pos_returns
+        FROM pos_sales ps
+        WHERE 1=1 ${posDateSql}
+      `, params),
+
+      db.query(`
+        SELECT COUNT(DISTINCT ps.id) AS active_pos_sales
+        FROM pos_sales ps
+        INNER JOIN pos_sale_items psi ON psi.pos_sale_id = ps.id
+        WHERE ps.transaction_type = 'sale'
+          AND psi.quantity > COALESCE(psi.returned_quantity, 0)
+          ${posDateSql}
+      `, params),
+
+      db.query(`
+        SELECT COALESCE(SUM(amount), 0) AS total_expenses
+        FROM expenses
+        WHERE 1=1 ${expenseDateSql}
+      `, params),
     ]);
+
+    const posStats = posStatsRows[0] || {};
+    const onlineRevenue = Number(revenueRows[0]?.delivered_revenue || 0);
+    const posNetRevenue = Number(posStats.pos_net_revenue || 0);
+    const onlineNetProfit = Number(netProfitRows[0]?.delivered_net_profit || 0);
+    const posNetProfit = Number(posStats.pos_net_profit || 0);
 
     res.status(200).json({
       success: true,
       data: {
         total_orders: Number(orderCountRows[0]?.total_orders || 0),
-        delivered_revenue: Number(revenueRows[0]?.delivered_revenue || 0),
-        delivered_net_profit: Number(netProfitRows[0]?.delivered_net_profit || 0),
-        total_returns: Number(returnsRows[0]?.total_returns || 0),
+        delivered_revenue: onlineRevenue + posNetRevenue,
+        delivered_net_profit: onlineNetProfit + posNetProfit,
+        total_returns:
+          Number(returnsRows[0]?.total_returns || 0) +
+          Number(posStats.pos_returns || 0),
+        total_pos_sales: Number(activePosSalesRows[0]?.active_pos_sales || 0),
+        total_expenses: Number(expenseRows[0]?.total_expenses || 0),
         pending_payments: Number(pendingPaymentRows[0]?.pending_payments || 0),
         total_products: Number(productRows[0]?.total_products || 0),
         // null = user is an admin (not owner), undefined values become null in JSON
