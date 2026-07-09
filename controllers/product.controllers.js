@@ -374,7 +374,7 @@ async function saveProductRecord(req, existingProduct = null) {
     const hasColors = normalizedColors.length > 0;
     const hasVariants = hasColors || normalizedSizeOptions.length > 0;
 
-    if (!name || !category_id || !price || !original_price || !description) {
+    if (!name || !category_id || !price || !original_price) {
       const error = new Error("All required product fields must be provided.");
       error.status = 400;
       throw error;
@@ -548,7 +548,7 @@ async function saveProductRecord(req, existingProduct = null) {
           original_price,
           old_price,
           slug,
-          description,
+          description || null,
           description_ar || null,
           specs_en || null,
           specs_ar || null,
@@ -577,7 +577,7 @@ async function saveProductRecord(req, existingProduct = null) {
           net_profit,
           old_price,
           slug,
-          description,
+          description || null,
           description_ar || null,
           specs_en || null,
           specs_ar || null,
