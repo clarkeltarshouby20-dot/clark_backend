@@ -58,10 +58,14 @@ const storage = new CloudinaryStorage({
   },
 });
 
-// ── File Filter Factory ────────────────────────────────────────────────────────
 /**
  * Creates a Multer file filter that validates both MIME type and file extension.
  * Double validation prevents spoofed file types (e.g., executable renamed to .jpg).
+ *
+ * Strict mode (default): BOTH mime AND extension must be in the allowed list.
+ * This is intentionally strict — if only the extension is valid but MIME is unrecognised
+ * (e.g. image/heic, image/tiff) we still reject, because the backend storage (Cloudinary)
+ * will reject those formats anyway, producing a confusing "works sometimes" experience.
  *
  * @param {object}   options
  * @param {string[]} options.allowedMimeTypes  - e.g. ["image/jpeg", "image/png"]
@@ -71,13 +75,17 @@ const storage = new CloudinaryStorage({
  */
 const buildFileFilter = ({ allowedMimeTypes, allowedExtensions, message }) => {
   return (req, file, cb) => {
-    const ext = path.extname(file.originalname || "").toLowerCase();
+    const ext  = path.extname(file.originalname || "").toLowerCase();
     const mime = `${file.mimetype || ""}`.toLowerCase();
-    const isAllowedMime = allowedMimeTypes.includes(mime);
-    const isAllowedExt = allowedExtensions.includes(ext);
 
-    // Reject if BOTH mime and extension checks fail
-    // (passing either is sufficient to handle edge cases like missing mime type)
+    // Reject if the MIME type is not explicitly allowed.
+    // We do NOT fall back to extension-only acceptance for product images because
+    // Cloudinary enforces the same MIME-based list server-side. Allowing mismatched
+    // files here would let them pass multer but fail on Cloudinary upload, causing
+    // a silent 500 error instead of a clear user-facing message.
+    const isAllowedMime = allowedMimeTypes.includes(mime);
+    const isAllowedExt  = allowedExtensions.includes(ext);
+
     if (!isAllowedMime && !isAllowedExt) {
       const error = new Error(message);
       error.status = 400;
@@ -87,6 +95,7 @@ const buildFileFilter = ({ allowedMimeTypes, allowedExtensions, message }) => {
     cb(null, true); // Accept the file
   };
 };
+
 
 // ── File Filter for General Images ───────────────────────────────────────────
 // Used for product images and user avatars
@@ -123,7 +132,7 @@ const upload = multer({
   storage: storage,
   fileFilter: defaultFileFilter,
   limits: {
-    fileSize: 2 * 1024 * 1024, // 2MB per file
+    fileSize: 5 * 1024 * 1024, // 5MB per file — matches the ImageUploader component maxSize
   },
 });
 
