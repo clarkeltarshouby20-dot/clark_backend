@@ -479,65 +479,100 @@ function roundMoney(value) {
   return Math.round(Number(value) * 100) / 100;
 }
 
+/**
+ * Computes the new price after applying a discount to the original selling price.
+ * @param {number} listPrice     - Original (pre-discount) selling price
+ * @param {string} discountType  - 'percent' | 'fixed'
+ * @param {number} discountValue - Discount amount
+ * @returns {number} New selling price, always >= 0
+ */
 function computeDiscountedPrice(listPrice, discountType, discountValue) {
   const list = roundMoney(listPrice);
   if (discountType === "percent") {
     const pct = Math.min(Math.max(Number(discountValue), 0), 100);
     return roundMoney(Math.max(list * (1 - pct / 100), 0));
   }
-  const fixed = roundMoney(discountValue);
+  const fixed = roundMoney(Number(discountValue));
   return roundMoney(Math.max(list - fixed, 0));
 }
 
 /**
  * POST /api/categories/:id/apply-discount
- * Applies a percentage or fixed discount to every product in the category.
+ *
+ * Applies a percentage or fixed discount to every product in the category,
+ * or clears (removes) an existing discount when discount_type = "none".
+ *
+ * ── Key fix: anti-compounding ─────────────────────────────────────────────
+ * Before this fix, changing a 10% discount to 20% would apply the 20% on top
+ * of the already-discounted price (e.g. 100 → 90 → 72), giving a ~28% effective
+ * discount instead of 20%.
+ *
+ * Now, for every product we first reconstruct the *original selling price* by
+ * adding back the stored discount amount (old_price), then apply the new
+ * discount on that baseline. This ensures each call is idempotent and
+ * independent of previous discount state.
+ *
+ * ── Fields used ──────────────────────────────────────────────────────────
+ *  price       → current selling price (may already be discounted)
+ *  old_price   → accumulated discount amount (selling - discounted selling)
+ *  net_profit  → selling price - cost price  (positive = gain)
+ *  original_price (fetched separately) → cost price set at product creation
  */
 const applyCategoryDiscount = async (req, res, next) => {
   try {
     await ensureCategorySchema();
     await ensureFinancialColumns();
+
     const { id } = req.params;
     const { discount_type, discount_value } = req.body || {};
 
+    // ── Validate discount_type ─────────────────────────────────────────────
     const discountType =
-      discount_type === "fixed"
-        ? "fixed"
-        : discount_type === "percent"
-          ? "percent"
-          : null;
-    const value = Number.parseFloat(discount_value);
+      discount_type === "fixed"   ? "fixed"  :
+      discount_type === "percent" ? "percent":
+      discount_type === "none"    ? "none"   : null;
 
-    if (!discountType || Number.isNaN(value) || value <= 0) {
+    if (!discountType) {
       return res.status(400).json({
         success: false,
-        message: "Discount type and value are required.",
+        message: "discount_type must be 'percent', 'fixed', or 'none'.",
       });
     }
 
-    if (discountType === "percent" && value > 100) {
-      return res.status(400).json({
-        success: false,
-        message: "Percentage cannot exceed 100.",
-      });
+    // ── Validate discount value for active discounts ───────────────────────
+    let discountValue = 0;
+    if (discountType !== "none") {
+      discountValue = Number.parseFloat(discount_value);
+      if (Number.isNaN(discountValue) || discountValue <= 0) {
+        return res.status(400).json({
+          success: false,
+          message: "Discount value must be a positive number.",
+        });
+      }
+      if (discountType === "percent" && discountValue > 100) {
+        return res.status(400).json({
+          success: false,
+          message: "Percentage cannot exceed 100.",
+        });
+      }
     }
 
-    const [categories] = await db.query(
+    // ── Fetch category ─────────────────────────────────────────────────────
+    const [categoryRows] = await db.query(
       "SELECT id, name FROM categories WHERE id = ?",
       [id],
     );
-    if (!categories.length) {
-      return res.status(404).json({
-        success: false,
-        message: "Category not found.",
-      });
+    if (!categoryRows.length) {
+      return res.status(404).json({ success: false, message: "Category not found." });
     }
 
+    // ── Fetch products ─────────────────────────────────────────────────────
+    // base_selling_price = immutable original selling price (admin-set, never changed by discounts)
+    // original_price     = cost price (what the business paid)
     const [products] = await db.query(
-      "SELECT id, price, old_price, net_profit, original_price FROM products WHERE category_id = ?",
+      "SELECT id, price, old_price, net_profit, original_price, base_selling_price FROM products WHERE category_id = ?",
       [id],
     );
-
     if (!products.length) {
       return res.status(400).json({
         success: false,
@@ -551,46 +586,67 @@ const applyCategoryDiscount = async (req, res, next) => {
       let updated = 0;
 
       for (const product of products) {
-        const listPrice = roundMoney(product.price);
-        const newPrice = computeDiscountedPrice(listPrice, discountType, value);
+        // ── 1. Base selling price (immutable reference) ────────────────────
+        // base_selling_price is set ONCE when the admin creates/edits a product
+        // and is NEVER touched by the discount engine. This is the stable baseline
+        // that prevents discounts from compounding on each other.
+        //
+        // Fallback (for products created before this column existed):
+        // reconstruct from price + old_price, which equals the pre-discount selling price.
+        const baseSellingPrice = roundMoney(
+          Number(product.base_selling_price) > 0
+            ? Number(product.base_selling_price)
+            : Number(product.price || 0) + Number(product.old_price || 0),
+        );
 
-        if (newPrice >= listPrice) {
-          continue;
+        // ── 2. Cost price (what the business paid for the item) ────────────
+        const costPrice = roundMoney(Number(product.original_price || 0));
+
+        let newPrice;
+        let newOldPrice; // discount amount to persist in old_price
+
+        if (discountType === "none") {
+          // Remove discount: restore product to its base selling price
+          newPrice    = baseSellingPrice;
+          newOldPrice = null;
+        } else {
+          // Always discount from the BASE selling price — never from the current (discounted) price
+          newPrice          = computeDiscountedPrice(baseSellingPrice, discountType, discountValue);
+          const discountAmt = roundMoney(baseSellingPrice - newPrice);
+          newOldPrice       = discountAmt > 0 ? discountAmt : null;
         }
 
-        const originalPrice = roundMoney(
-          product.original_price ??
-            Number(product.price || 0) + Number(product.net_profit || 0),
-        );
-        const additionalDiscount = roundMoney(listPrice - newPrice);
-        const newProductDiscount = roundMoney(
-          Number(product.old_price || 0) + additionalDiscount,
-        );
-        const newNetProfit = roundMoney(originalPrice - newPrice);
+        // ── 3. Recalculate net profit ──────────────────────────────────────
+        // net_profit = new selling price − cost price  (positive = business gain)
+        const newNetProfit = roundMoney(newPrice - costPrice);
 
         await connection.query(
           "UPDATE products SET price = ?, old_price = ?, net_profit = ? WHERE id = ?",
-          [newPrice, newProductDiscount, newNetProfit, product.id],
+          [newPrice, newOldPrice, newNetProfit, product.id],
         );
         updated += 1;
       }
 
+      // Persist discount metadata on the category row
       await connection.query(
         "UPDATE categories SET discount_type = ?, discount_value = ? WHERE id = ?",
-        [discountType, value, id],
+        [discountType, discountType !== "none" ? discountValue : 0, id],
       );
 
       await connection.commit();
 
       res.status(200).json({
         success: true,
-        message: `Discount applied to ${updated} product(s).`,
+        message:
+          discountType === "none"
+            ? `Discount removed from ${updated} product(s).`
+            : `Discount applied to ${updated} product(s).`,
         data: {
-          updated_count: updated,
-          category_id: Number(id),
-          category_name: categories[0].name,
-          discount_type: discountType,
-          discount_value: value,
+          updated_count:  updated,
+          category_id:    Number(id),
+          category_name:  categoryRows[0].name,
+          discount_type:  discountType,
+          discount_value: discountType !== "none" ? discountValue : 0,
         },
       });
     } catch (error) {

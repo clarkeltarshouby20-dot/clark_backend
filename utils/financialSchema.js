@@ -111,6 +111,34 @@ async function ensureFinancialColumnsWithConnection(connection) {
     `);
   }
 
+  // ── Check products.base_selling_price ─────────────────────────────────────
+  // base_selling_price = the selling price set by the admin at product creation.
+  // This column is NEVER overwritten when category discounts are applied.
+  // It provides a stable, non-accumulating baseline so that changing a category
+  // discount from 10% to 20% always calculates on the original price (not the
+  // already-discounted price), eliminating the compounding discount bug.
+  const productHasBaseSellingPrice = await hasColumn(
+    connection,
+    "products",
+    "base_selling_price",
+  );
+  if (!productHasBaseSellingPrice) {
+    await connection.query(`
+      ALTER TABLE products
+      ADD COLUMN base_selling_price DECIMAL(10,2) NOT NULL DEFAULT 0.00
+      AFTER original_price
+    `);
+
+    // Backfill: reconstruct original selling price from current data.
+    // old_price stores the accumulated discount amount, so:
+    //   base_selling_price = current_price + discount_amount
+    await connection.query(`
+      UPDATE products
+      SET base_selling_price = price + COALESCE(old_price, 0)
+      WHERE base_selling_price = 0
+    `);
+  }
+
   // ── Check order_items.unit_net_profit ──────────────────────────────────────
   const orderItemsHaveUnitNetProfit = await hasColumn(
     connection,

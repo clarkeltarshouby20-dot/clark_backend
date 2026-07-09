@@ -420,7 +420,8 @@ async function saveProductRecord(req, existingProduct = null) {
       throw error;
     }
 
-    const net_profit = Math.round((original_price - price) * 100) / 100;
+    // net_profit = selling price − cost price (positive = business gain)
+    const net_profit = Math.round((price - original_price) * 100) / 100;
 
     const expectedCombos = getExpectedVariantCombos(
       normalizedColors,
@@ -528,7 +529,8 @@ async function saveProductRecord(req, existingProduct = null) {
           UPDATE products
           SET name = ?, name_ar = ?, category_id = ?, price = ?, original_price = ?, old_price = ?,
               slug = ?, description = ?, description_ar = ?, specs_en = ?, specs_ar = ?,
-              stock = ?, is_active = ?, size_mode = ?, net_profit = ?
+              stock = ?, is_active = ?, size_mode = ?, net_profit = ?,
+              base_selling_price = ?
           WHERE id = ?
         `,
         [
@@ -547,6 +549,7 @@ async function saveProductRecord(req, existingProduct = null) {
           is_active ? 1 : 0,
           normalizedSizeMode,
           net_profit,
+          price, // base_selling_price is reset to the new admin-set price on every manual edit
           productId,
         ],
       );
@@ -555,8 +558,8 @@ async function saveProductRecord(req, existingProduct = null) {
         `
           INSERT INTO products (
             name, name_ar, category_id, price, original_price, net_profit, old_price, slug, description,
-            description_ar, specs_en, specs_ar, stock, is_active, size_mode
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            description_ar, specs_en, specs_ar, stock, is_active, size_mode, base_selling_price
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `,
         [
           name,
@@ -574,6 +577,7 @@ async function saveProductRecord(req, existingProduct = null) {
           totalVariantStock,
           is_active ? 1 : 0,
           normalizedSizeMode,
+          price, // base_selling_price = selling price set by admin at creation
         ],
       );
       productId = result.insertId;
