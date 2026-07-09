@@ -76,6 +76,7 @@ function normalizeColors(rawColors) {
       value: String(color.value || "").trim(),
       sort_order:
         color.sort_order !== undefined ? Number(color.sort_order) : index,
+      existing_images: parseJsonArray(color.existing_images || color.existingImages),
     }))
     .filter((color) => color.name && color.value);
 }
@@ -469,14 +470,18 @@ async function saveProductRecord(req, existingProduct = null) {
     if (hasColors) {
       for (const color of normalizedColors) {
         const files = colorImages.get(color.client_key) || [];
-        if (!existingProduct && files.length === 0) {
+        const uploadedCount = files.length;
+        const keptCount = (color.existing_images || []).length;
+
+        if (uploadedCount === 0 && keptCount === 0) {
           const error = new Error(
             `Please upload at least one image for color "${color.name}".`,
           );
           error.status = 400;
           throw error;
         }
-        if (files.length > 5) {
+
+        if (uploadedCount + keptCount > 5) {
           const error = new Error(
             `Color "${color.name}" cannot have more than 5 images.`,
           );
@@ -486,7 +491,9 @@ async function saveProductRecord(req, existingProduct = null) {
       }
     }
 
-    if (!hasColors && generalImages.length === 0 && !existingProduct) {
+    const keptGeneralImages = parseJsonArray(req.body.existing_images);
+    const generalImagesCount = generalImages.length + keptGeneralImages.length;
+    if (!hasColors && generalImagesCount === 0) {
       const error = new Error("At least one main product image is required.");
       error.status = 400;
       throw error;
@@ -588,19 +595,47 @@ async function saveProductRecord(req, existingProduct = null) {
       await connection.query("DELETE FROM product_images WHERE product_id = ?", [
         productId,
       ]);
-    } else if (generalImages.length > 0) {
-      await connection.query("DELETE FROM product_images WHERE product_id = ?", [
-        productId,
-      ]);
+    } else {
+      // Sync general images: keep only the ones in keptGeneralImages
+      if (keptGeneralImages.length > 0) {
+        await connection.query(
+          "DELETE FROM product_images WHERE product_id = ? AND image_url NOT IN (?)",
+          [productId, keptGeneralImages]
+        );
+      } else {
+        await connection.query(
+          "DELETE FROM product_images WHERE product_id = ?",
+          [productId]
+        );
+      }
 
-      await Promise.all(
-        generalImages.map((file, index) =>
-          connection.query(
-            "INSERT INTO product_images (product_id, image_url, is_main) VALUES (?, ?, ?)",
-            [productId, file.path, index === 0 ? 1 : 0],
-          ),
-        ),
+      // Insert new uploaded images
+      if (generalImages.length > 0) {
+        await Promise.all(
+          generalImages.map((file) =>
+            connection.query(
+              "INSERT INTO product_images (product_id, image_url, is_main) VALUES (?, ?, ?)",
+              [productId, file.path, 0]
+            )
+          )
+        );
+      }
+
+      // Re-order general images and set the first one as main
+      const [currentImages] = await connection.query(
+        "SELECT id FROM product_images WHERE product_id = ? ORDER BY id ASC",
+        [productId]
       );
+      if (currentImages.length > 0) {
+        await Promise.all(
+          currentImages.map((img, index) =>
+            connection.query(
+              "UPDATE product_images SET is_main = ? WHERE id = ?",
+              [index === 0 ? 1 : 0, img.id]
+            )
+          )
+        );
+      }
     }
 
     const [existingColorsRows] = await connection.query(
@@ -651,23 +686,50 @@ async function saveProductRecord(req, existingProduct = null) {
         colorIdByClientKey.set(color.client_key, productColorId);
 
         const uploadedFiles = colorImages.get(color.client_key) || [];
-        if (uploadedFiles.length > 0) {
+        const keptColorImages = color.existing_images || [];
+
+        // Delete color images that are no longer in keptColorImages
+        if (keptColorImages.length > 0) {
+          await connection.query(
+            "DELETE FROM product_color_images WHERE product_color_id = ? AND image_url NOT IN (?)",
+            [productColorId, keptColorImages]
+          );
+        } else {
           await connection.query(
             "DELETE FROM product_color_images WHERE product_color_id = ?",
-            [productColorId],
+            [productColorId]
           );
+        }
 
+        // Insert new ones
+        if (uploadedFiles.length > 0) {
           await Promise.all(
-            uploadedFiles.map((file, index) =>
+            uploadedFiles.map((file) =>
               connection.query(
                 `
                   INSERT INTO product_color_images (
                     product_color_id, image_url, sort_order, is_main
                   ) VALUES (?, ?, ?, ?)
                 `,
-                [productColorId, file.path, index, index === 0 ? 1 : 0],
+                [productColorId, file.path, 99, 0],
               ),
             ),
+          );
+        }
+
+        // Re-order and reset main flag for color images
+        const [currentColImages] = await connection.query(
+          "SELECT id FROM product_color_images WHERE product_color_id = ? ORDER BY id ASC",
+          [productColorId]
+        );
+        if (currentColImages.length > 0) {
+          await Promise.all(
+            currentColImages.map((img, index) =>
+              connection.query(
+                "UPDATE product_color_images SET sort_order = ?, is_main = ? WHERE id = ?",
+                [index, index === 0 ? 1 : 0, img.id]
+              )
+            )
           );
         }
       }
